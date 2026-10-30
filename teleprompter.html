@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تطبيق التلقين</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:"Segoe UI",Tahoma,Arial,sans-serif;background:#161616;color:#eee}
+#editor{padding:20px;max-width:960px;margin:0 auto;height:100%;display:flex;flex-direction:column;gap:12px}
+h1{font-size:22px;margin:0}
+textarea{flex:1;min-height:300px;font-size:20px;padding:14px;border-radius:8px;border:1px solid #444;background:#1f1f1f;color:#fff;line-height:1.9;resize:none;font-family:inherit}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.row label{font-size:17px}
+button{font-size:17px;padding:10px 16px;border:0;border-radius:8px;background:#2d6cdf;color:#fff;cursor:pointer;font-family:inherit}
+button.sec{background:#444}
+button.big{font-size:20px;padding:12px 26px;background:#1e8e3e}
+.hint{font-size:15px;color:#aaa;margin:0;line-height:1.8}
+#stage{position:fixed;inset:0;background:#000;color:#fff;display:none;overflow:hidden;user-select:none}
+#guide{position:absolute;left:0;right:0;top:40vh;height:3px;background:rgba(255,212,0,.45);pointer-events:none;z-index:2}
+#text{position:absolute;left:0;right:0;top:40vh;padding:0 6vw 70vh;font-size:64px;line-height:1.7;text-align:right;will-change:transform}
+#text .w{transition:color .2s}
+#text .cur{color:#ffd400}
+#hud{position:absolute;bottom:0;left:0;right:0;padding:10px 14px;background:rgba(0,0,0,.8);font-size:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;opacity:0;transition:opacity .3s;z-index:3}
+#hud.show{opacity:1}
+#hud button{padding:8px 12px;font-size:15px}
+#status{position:absolute;top:0;left:0;right:0;padding:6px 12px;background:rgba(0,0,0,.65);font-size:15px;color:#ffd400;z-index:4;pointer-events:none}
+</style>
+</head>
+<body>
+
+<div id="editor">
+  <h1>تطبيق التلقين</h1>
+  <textarea id="src" placeholder="الصق النص هنا، أو حمّل ملف txt"></textarea>
+  <div class="row">
+    <input type="file" id="file" accept=".txt,text/plain" hidden>
+    <button class="sec" id="btnFile">تحميل ملف txt</button>
+    <button class="big" id="btnStart">ابدأ التلقين</button>
+    <label>السرعة <input type="range" id="speedIn" min="5" max="300" value="40"></label>
+    <label>حجم الخط <input type="range" id="fontIn" min="24" max="180" value="64"></label>
+    <label><input type="checkbox" id="mirrorIn"> وضع المرآة</label>
+    <label><input type="checkbox" id="voiceIn"> تتبع الصوت</label>
+    <label>لغة التعرف <select id="langIn"><option value="ar-EG">العربية</option><option value="en-US">English</option></select></label>
+    <button class="sec" id="btnMic">تفعيل الميكروفون وعرض الأجهزة</button>
+    <span id="micMsg" class="hint"></span>
+  </div>
+  <p class="hint">
+    المفاتيح: مسافة أو Enter للتشغيل والإيقاف. الأسهم العليا والسفلى للسرعة. Page Up و Page Down للقفز صفحة. الأسهم اليمنى واليسرى للقفز. M للمرآة. V لتتبع الصوت. زائد وناقص لحجم الخط. Home للبداية. Esc للخروج.
+    <br>
+    جهاز البلوتوث: زر A للتشغيل والإيقاف. زر B للخروج. D-pad للأعلى والأسفل للسرعة. LB و RB لحجم الخط. Select للبداية.
+    <br>
+    تتبع الصوت يحتاج Microsoft Edge أو Google Chrome مع السماح للميكروفون.
+  </p>
+</div>
+
+<div id="stage">
+  <div id="guide"></div>
+  <div id="text"></div>
+  <div id="hud">
+    <button id="hPlay">تشغيل / إيقاف</button>
+    <button id="hSlow">أبطأ</button>
+    <button id="hFast">أسرع</button>
+    <button id="hFm">خط -</button>
+    <button id="hFp">خط +</button>
+    <button id="hMir">مرآة</button>
+    <button id="hVoice">تتبع الصوت</button>
+    <button id="hTop">للبداية</button>
+    <button id="hExit">خروج</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<script>
+const $ = s => document.getElementById(s);
+const KEY_SCRIPT = 'tp_script', KEY_SET = 'tp_settings';
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+let S = { speed: 40, font: 64, mirror: false, voice: false };
+let words = [], wordEls = [], curIdx = -1;
+let pos = 0, playing = false, lastT = 0;
+let rec = null, recLang = 'ar-EG', started = false, startWatch = null, voiceMsg = '';
+let voiceOn = false, wake = null, hudTimer = null, voiceHeard = '';
+let padPrev = {};
+
+function norm(w) {
+  return w.replace(/[ً-ْـ]/g, '')
+          .replace(/[أإآ]/g, 'ا')
+          .replace(/ى/g, 'ي')
+          .replace(/ة/g, 'ه')
+          .replace(/[^ء-ي\w]/g, '')
+          .toLowerCase();
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/* ---------- Storage ---------- */
+function loadAll() {
+  try {
+    $('src').value = localStorage.getItem(KEY_SCRIPT) || '';
+    const s = JSON.parse(localStorage.getItem(KEY_SET) || 'null');
+    if (s) S = Object.assign(S, s);
+  } catch (e) {}
+  syncEditor();
+}
+function saveAll() {
+  try {
+    localStorage.setItem(KEY_SCRIPT, $('src').value);
+    localStorage.setItem(KEY_SET, JSON.stringify(S));
+  } catch (e) {}
+}
+function syncEditor() {
+  $('speedIn').value = S.speed;
+  $('fontIn').value = S.font;
+  $('mirrorIn').checked = S.mirror;
+  $('voiceIn').checked = S.voice;
+}
+function readEditor() {
+  S.speed = +$('speedIn').value;
+  S.font = +$('fontIn').value;
+  S.mirror = $('mirrorIn').checked;
+  S.voice = $('voiceIn').checked;
+}
+
+/* ---------- Build text ---------- */
+function build() {
+  const box = $('text');
+  box.innerHTML = '';
+  words = []; wordEls = []; curIdx = -1;
+  box.style.fontSize = S.font + 'px';
+  const lines = $('src').value.split(/\n+/).map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const p = document.createElement('p');
+    p.style.margin = '0 0 .7em';
+    p.dir = 'auto';
+    p.style.textAlign = 'start';
+    const ws = line.split(/\s+/);
+    ws.forEach((w, i) => {
+      const s = document.createElement('span');
+      s.className = 'w';
+      s.textContent = w + (i < ws.length - 1 ? ' ' : '');
+      p.appendChild(s);
+      wordEls.push(s);
+      words.push(norm(w));
+    });
+    box.appendChild(p);
+  }
+  if (!wordEls.length) box.textContent = 'لا يوجد نص.';
+}
+
+/* ---------- Scrolling ---------- */
+function maxPos() {
+  return Math.max(0, $('text').offsetHeight - innerHeight * 0.7);
+}
+function applyT() {
+  $('text').style.transform = `translateY(${-pos}px) scaleX(${S.mirror ? -1 : 1})`;
+}
+function frame(t) {
+  const dt = lastT ? Math.min((t - lastT) / 1000, 0.1) : 0;
+  lastT = t;
+  if ($('stage').style.display === 'block') {
+    if (playing) {
+      pos = Math.min(pos + S.speed * dt, maxPos());
+      if (pos >= maxPos()) playing = false;
+      applyT();
+      updStatus();
+    }
+    pollPad();
+  }
+  requestAnimationFrame(frame);
+}
+function setCur(i) {
+  if (i === curIdx) return;
+  if (curIdx >= 0) wordEls[curIdx].classList.remove('cur');
+  curIdx = i;
+  const el = wordEls[i];
+  el.classList.add('cur');
+  pos = clamp(el.offsetTop - 12, 0, maxPos());
+  applyT();
+  updStatus();
+}
+function jump(dir) {
+  pos = clamp(pos + dir * innerHeight * 0.5, 0, maxPos());
+  applyT();
+  updStatus();
+}
+function togglePlay() {
+  if (voiceOn) { setMicMsg('تتبع الصوت يعمل. أوقفه أولا لاستخدام التمرير التلقائي.'); return; }
+  playing = !playing;
+  if (playing && pos >= maxPos()) pos = 0;
+  updStatus();
+}
+function adjSpeed(d) {
+  S.speed = clamp(S.speed + d, 5, 300);
+  updStatus();
+}
+function adjFont(d) {
+  S.font = clamp(S.font + d, 24, 180);
+  $('text').style.fontSize = S.font + 'px';
+  if (curIdx >= 0) pos = clamp(wordEls[curIdx].offsetTop - 12, 0, maxPos());
+  applyT();
+  updStatus();
+}
+function toggleMirror() {
+  S.mirror = !S.mirror;
+  applyT();
+  updStatus();
+}
+function resetTop() {
+  pos = 0;
+  playing = false;
+  if (curIdx >= 0) { wordEls[curIdx].classList.remove('cur'); curIdx = -1; }
+  applyT();
+  updStatus();
+}
+function updStatus() {
+  $('status').textContent =
+    `السرعة ${S.speed} | الخط ${S.font} | ${playing ? 'يعمل' : 'متوقف'}` +
+    (voiceOn ? ' | تتبع الصوت' : '') +
+    (voiceMsg ? ' | ' + voiceMsg : '') +
+    (voiceHeard ? ' | سمعت: ' + voiceHeard : '') +
+    ` | الكلمة ${curIdx + 1} من ${words.length}`;
+}
+
+function setMicMsg(t) {
+  voiceMsg = t;
+  $('micMsg').textContent = t;
+  updStatus();
+}
+
+/* ---------- Voice tracking ---------- */
+// Speech engines often write a word slightly differently. Allow one letter of difference.
+function fuzzyEq(a, b) {
+  if (a === b) return true;
+  if (a.length < 4 || b.length < 4) return false;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  const d = [];
+  for (let i = 0; i <= a.length; i++) d[i] = [i];
+  for (let j = 0; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                         d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+  }
+  return d[a.length][b.length] <= 1;
+}
+function matchVoice(txt) {
+  const raw = txt.trim().split(/\s+/).filter(Boolean);
+  voiceHeard = raw.slice(-4).join(' ');
+  const sp = raw.map(norm).filter(Boolean).slice(-4);
+  if (!sp.length || !words.length) { updStatus(); return; }
+  const start = Math.max(0, curIdx);
+  for (let k = sp.length; k >= 1; k--) {
+    const key = sp.slice(-k);
+    // A single word is accepted only right after the current position,
+    // so ordinary words said to a person (not read from the script) cannot jump the text.
+    if (k === 1 && key[0].length < 4) continue;
+    const end = Math.min(words.length, start + (k >= 2 ? 120 : 4));
+    for (let j = start; j + k - 1 < end; j++) {
+      let ok = true;
+      for (let m = 0; m < k; m++) {
+        if (!fuzzyEq(words[j + m], key[m])) { ok = false; break; }
+      }
+      if (ok) { setCur(j + k - 1); updStatus(); return; }
+    }
+  }
+  updStatus();
+}
+function startVoice() {
+  if (!SR) {
+    alert('التعرف على الصوت غير مدعوم في هذا المتصفح. استخدم Microsoft Edge أو Google Chrome.');
+    voiceOn = false;
+    setVoiceBtn();
+    return;
+  }
+  // One recognizer at a time. Two running together makes the engine hang.
+  recLang = $('langIn').value;
+  playing = false;
+  voiceHeard = '';
+  voiceOn = true;
+  $('hud').classList.add('show');
+  setMicMsg('');
+  startRec();
+  setVoiceBtn();
+}
+function startRec() {
+  if (!voiceOn) return;
+  started = false;
+  clearTimeout(startWatch);
+  startWatch = setTimeout(() => {
+    if (!started) setMicMsg('لم يبدأ التعرف خلال 6 ثوان. تأكد من السماح بالميكروفون.');
+  }, 6000);
+  try {
+    rec = new SR();
+    rec.lang = recLang;
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onstart = () => { started = true; clearTimeout(startWatch); setMicMsg('يستمع الآن.'); };
+    rec.onresult = e => {
+      let t = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) t += e.results[i][0].transcript + ' ';
+      matchVoice(t);
+    };
+    rec.onerror = e => {
+      setMicMsg('خطأ: ' + e.error);
+      if (['not-allowed', 'service-not-allowed', 'audio-capture'].includes(e.error)) stopVoice();
+    };
+    rec.onend = () => {
+      if (!voiceOn) return;
+      if (started) setTimeout(startRec, 300);
+      else stopVoice();
+    };
+    rec.start();
+  } catch (e) {
+    setMicMsg('تعذر بدء التعرف: ' + e.message);
+    stopVoice();
+  }
+}
+function stopVoice() {
+  voiceOn = false;
+  clearTimeout(startWatch);
+  try { if (rec) rec.stop(); } catch (e) {}
+  rec = null;
+  setVoiceBtn();
+}
+function toggleVoice() {
+  if (voiceOn) stopVoice(); else startVoice();
+  S.voice = voiceOn;
+  updStatus();
+}
+function setVoiceBtn() {
+  $('hVoice').textContent = voiceOn ? 'إيقاف الصوت' : 'تتبع الصوت';
+  updStatus();
+}
+
+/* ---------- Gamepad (Bluetooth) ---------- */
+function pollPad() {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (const p of pads) {
+    if (!p) continue;
+    const b = p.buttons;
+    const edge = (i, fn) => {
+      const key = p.index + '_' + i;
+      const now = !!(b[i] && b[i].pressed);
+      if (now && !padPrev[key]) fn();
+      padPrev[key] = now;
+    };
+    edge(0, togglePlay);      // A
+    edge(1, endShow);         // B
+    edge(12, () => adjSpeed(5));   // D-pad up
+    edge(13, () => adjSpeed(-5));  // D-pad down
+    edge(5, () => adjFont(4));     // RB
+    edge(4, () => adjFont(-4));    // LB
+    edge(8, resetTop);             // Select
+    edge(15, () => jump(1));       // D-pad right
+    edge(14, () => jump(-1));      // D-pad left
+  }
+}
+
+/* ---------- Wake lock ---------- */
+async function lockWake() {
+  try {
+    if ('wakeLock' in navigator) wake = await navigator.wakeLock.request('screen');
+  } catch (e) {}
+}
+function releaseWake() {
+  try { if (wake) wake.release(); } catch (e) {}
+  wake = null;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && $('stage').style.display === 'block') lockWake();
+});
+
+/* ---------- Show / hide ---------- */
+function startShow() {
+  readEditor();
+  saveAll();
+  build();
+  if (!wordEls.length) return;
+  $('stage').style.display = 'block';
+  pos = 0; playing = false;
+  applyT();
+  updStatus();
+  try {
+    const p = document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+  lockWake();
+  if (S.voice) startVoice();
+}
+function endShow() {
+  playing = false;
+  stopVoice();
+  $('stage').style.display = 'none';
+  try {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  } catch (e) {}
+  releaseWake();
+  saveAll();
+}
+
+/* ---------- Microphone ---------- */
+// The speech engine always uses the Windows default recording device.
+// The browser cannot pick a device for it, so this only asks for permission and lists devices.
+async function setupMics() {
+  const msg = $('micMsg');
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({ audio: true });
+    st.getTracks().forEach(t => t.stop());
+  } catch (e) {
+    msg.textContent = 'لم يُسمح بالميكروفون. افتح إعدادات الموقع في المتصفح وفعّل الميكروفون لهذه الصفحة، ثم أعد التحميل. الخطأ: ' + (e.name || 'غير معروف');
+    return;
+  }
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+  const names = devs.map((d, i) => d.label || ('ميكروفون ' + (i + 1))).join('، ');
+  msg.textContent = devs.length
+    ? 'الأجهزة المتاحة: ' + names + '. التعرف على الصوت يستخدم الميكروفون الافتراضي في ويندوز، فاضبطه من إعدادات الصوت.'
+    : 'لم يُعثر على ميكروفون.';
+}
+
+/* ---------- Events ---------- */
+$('btnMic').addEventListener('click', setupMics);
+document.addEventListener('keydown', e => {
+  if ($('stage').style.display !== 'block') return;
+  const map = {
+    ' ': togglePlay, 'Enter': togglePlay,
+    'ArrowUp': () => adjSpeed(5), 'ArrowDown': () => adjSpeed(-5),
+    'PageDown': () => jump(1), 'PageUp': () => jump(-1),
+    'ArrowRight': () => jump(1), 'ArrowLeft': () => jump(-1),
+    'Home': resetTop,
+    'm': toggleMirror, 'M': toggleMirror,
+    'v': toggleVoice, 'V': toggleVoice,
+    '+': () => adjFont(4), '=': () => adjFont(4),
+    '-': () => adjFont(-4), '_': () => adjFont(-4),
+    'Escape': endShow
+  };
+  if (map[e.key]) { e.preventDefault(); map[e.key](); }
+});
+
+document.addEventListener('mousemove', () => {
+  if ($('stage').style.display !== 'block') return;
+  $('hud').classList.add('show');
+  clearTimeout(hudTimer);
+  hudTimer = setTimeout(() => { if (!voiceOn) $('hud').classList.remove('show'); }, 2500);
+});
+
+$('btnStart').addEventListener('click', startShow);
+$('btnFile').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $('src').value = r.result; saveAll(); };
+  r.readAsText(f, 'UTF-8');
+  e.target.value = '';
+});
+['speedIn', 'fontIn', 'mirrorIn', 'voiceIn'].forEach(id =>
+  $(id).addEventListener('change', () => { readEditor(); saveAll(); }));
+
+$('hPlay').addEventListener('click', togglePlay);
+$('hSlow').addEventListener('click', () => adjSpeed(-5));
+$('hFast').addEventListener('click', () => adjSpeed(5));
+$('hFm').addEventListener('click', () => adjFont(-4));
+$('hFp').addEventListener('click', () => adjFont(4));
+$('hMir').addEventListener('click', toggleMirror);
+$('hVoice').addEventListener('click', toggleVoice);
+$('hTop').addEventListener('click', resetTop);
+$('hExit').addEventListener('click', endShow);
+
+/* ---------- Init ---------- */
+loadAll();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
